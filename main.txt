@@ -1,0 +1,381 @@
+
+import pandas as pd
+import numpy as np
+import datetime as dt
+import scipy.stats as stats
+import pylab as plt
+import matplotlib
+import os
+import time
+import io
+import requests
+
+from sklearn.linear_model import LinearRegression  #GBM algorithm
+from sklearn.ensemble import GradientBoostingRegressor  #GBM algorithm
+from sklearn.ensemble import RandomForestRegressor  #Random Forest algorithm
+from sklearn import cross_validation, metrics   #Additional scklearn functions
+from sklearn.grid_search import GridSearchCV   #Perforing grid search
+
+from sklearn.externals import joblib #For importing and exporting final GBM model
+from sklearn.datasets import load_digits #For importing and exporting final GBM model
+
+import matplotlib.pylab as plt
+%matplotlib inline
+from matplotlib.pylab import rcParams
+rcParams['figure.figsize'] = 12, 4
+
+
+os.chdir("A:\Dropbox\Hunt\C1")
+
+"""Q1"""
+
+raw_url="https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-09.csv"
+raw_req=requests.get(raw_url).content
+raw=pd.read_csv(io.StringIO(raw_req.decode('utf-8')))
+#trim blank space in column names
+raw.columns = [col.strip() for col in raw.columns]
+
+
+print " "
+print "Q1"
+print "Number of rows: " +str(raw.shape[0])
+print "Number of columns: " +str(raw.shape[1])
+
+
+"""Q2"""
+print " "
+print "Q2"
+#get summary statistics
+print "Summary statistics on Trip_distance"
+print raw['Trip_distance'].describe(percentiles=[0.001, 0.01, 0.25, 0.5, 0.75, 0.99, 0.999])
+
+#draw histogram withint range [0,15].
+#there are big outliers on the right tail so drawing everything will make the figure unreadable.
+raw['Trip_distance'].hist(bins=30, range=(0,15))
+plt.title('Histogram of Trip Distance (Capped at 15)')
+matplotlib.pyplot.savefig('q2_hist.png', dpi=300)
+
+
+"""Q3"""
+print " "
+print "Q3"
+#create varaible pickup_hour
+raw['lpep_pickup_datetime'] = pd.to_datetime(raw['lpep_pickup_datetime'])
+raw['Lpep_dropoff_datetime'] = pd.to_datetime(raw['Lpep_dropoff_datetime'])
+
+raw['pick_hour'] = raw['lpep_pickup_datetime'].dt.hour
+print "Mean and Median Trip_distance by hour of the day"
+print raw.groupby('pick_hour').agg({'Trip_distance':['mean', 'median']})
+
+
+#Coordiate of JFK airport terminal Area from Google Map
+#(40.652421, -73.796020)
+#(40.652421, -73.773261)
+#(40.638176, -73.773261)
+#(40.638176, -73.796020)
+
+#define jfk_in = 1 if either pickup or dropoff coordinates fall into the square area noted above.
+raw['jfk_in'] = ((raw['Pickup_longitude']>-73.796020) & (raw['Pickup_longitude']<-73.773261) & (raw['Pickup_latitude']>40.638176) & (raw['Pickup_latitude']<40.652421)) | ((raw['Dropoff_longitude']>-73.796020) & (raw['Dropoff_longitude']<-73.773261) & (raw['Dropoff_latitude']>40.638176) & (raw['Dropoff_latitude']<40.652421))
+
+print "Total # of Trips that originate or terminate at JFK: " + str(raw['jfk_in'].sum())
+print "Average fare of JFK Trips: " + str(raw['Total_amount'].loc[raw['jfk_in']==1].mean())
+
+#Other observation of the traffic data.
+print "Total # of Trips that originated at JFK: " + str(((raw['Pickup_longitude']>-73.796020) & (raw['Pickup_longitude']<-73.773261) & (raw['Pickup_latitude']>40.638176) & (raw['Pickup_latitude']<40.652421)).sum())
+print "Total # of Trips that terminated at JFK: " + str(((raw['Dropoff_longitude']>-73.796020) & (raw['Dropoff_longitude']<-73.773261) & (raw['Dropoff_latitude']>40.638176) & (raw['Dropoff_latitude']<40.652421)).sum())
+
+#Comparing RateCodeID==2 to JFK flag
+pd.crosstab(index=raw['jfk_in'], columns=(raw['RateCodeID']==2))
+
+temp_example_jfk = raw.loc[(raw['RateCodeID']==2) & (raw['jfk_in']==0), ['RateCodeID', 'jfk_in', 'Pickup_latitude', 'Pickup_longitude','Dropoff_latitude', 'Dropoff_longitude', 'Trip_distance', 'Fare_amount', 'Total_amount']].sample(n=10, random_state=267)
+
+
+"""Q4"""
+print " "
+print "Q4"
+#define tip percentage
+raw['tip_perc']= raw['Tip_amount']/raw['Total_amount']
+print "Number of missing values for tip percentage: " + str(raw['tip_perc'].isnull().sum())
+print "Number of zero values for Total_amount: " + str((raw['Total_amount']==0).sum())
+print "Sumamry Statistics for Tip Percentage"
+print raw['tip_perc'].describe(percentiles=[0.001, 0.01, 0.25, 0.5, 0.75, 0.99, 0.999])
+print ""
+
+#check the relationship between payment type and tip percentage.
+print "summary statistics by Payment_type"
+print raw.groupby('Payment_type').agg({'tip_perc':['count', 'mean', 'median', 'min', 'max']})
+
+print "Count when tip_perc == 0 and Payment_type != 1 (Credit card): " + str(raw['tip_perc'].loc[(raw['tip_perc'] == 0) & (raw['Payment_type'] != 1)].count())
+print "Count when Payment_type != 1 (Credit card): " + str(raw['tip_perc'].loc[(raw['Payment_type'] != 1)].count())
+
+#For Payment_type other than 1 (Credit card), predict tip_perc = 0
+#Separate out the data when Payment_type == 1 and remove obs with missing tip_percentage (due to zero value for Total_amount)
+datacc = raw[raw['Payment_type'] == 1 & raw['tip_perc'].notnull()]
+
+#create  hour of day and day of week based on pick up time.
+datacc['pick_hourofday'] = datacc['lpep_pickup_datetime'].dt.hour
+datacc['pick_dayofweek'] = datacc['lpep_pickup_datetime'].dt.dayofweek
+
+#calculate trip time length in the unit minutes.
+datacc['trip_time'] =(datacc['Lpep_dropoff_datetime'] - datacc['lpep_pickup_datetime']).dt.total_seconds()/60
+
+#set missing value for Trip_type to 1.
+datacc.loc[datacc['Trip_type'].isnull(), 'Trip_type'] = 1
+
+#define trip speed;
+datacc['trip_speed'] = datacc['Trip_distance']/datacc['trip_time']
+datacc.loc[datacc['trip_speed'].isnull(), 'trip_speed'] = 0
+datacc.loc[datacc['trip_speed']>999, 'trip_speed'] = 999
+
+#assign binning variables for locations
+#get summary stat for longitude and latitude.
+#pickup location
+print datacc['Pickup_longitude'].describe(percentiles=[0.001, 0.01, 0.2, 0.4, 0.5, 0.6, 0.8, 0.99, 0.999])
+print datacc['Pickup_latitude'].describe(percentiles=[0.001, 0.01, 0.2, 0.4, 0.5, 0.6, 0.8, 0.99, 0.999])
+
+#Devide into 10 by 10 Grid based on percentiles
+longitude_grid = datacc['Pickup_longitude'].quantile(np.arange(0.1, 1, 0.1)).append(pd.Series([-999, 999])).sort_values().round(decimals=4)
+latitude_grid =datacc['Pickup_latitude'].quantile(np.arange(0.1, 1, 0.1)).append(pd.Series([-999, 999])).sort_values().round(decimals=4)
+
+datacc['Pickup_longitude_cut'] = pd.cut(datacc['Pickup_longitude'], longitude_grid)
+datacc['Pickup_latitude_cut'] = pd.cut(datacc['Pickup_latitude'], latitude_grid)
+
+datacc['Pickup_longitude_cutcode'] = datacc['Pickup_longitude_cut'].cat.codes
+datacc['Pickup_latitude_cutcode'] = datacc['Pickup_latitude_cut'].cat.codes
+datacc['Pickup_location_cutcode'] = datacc['Pickup_longitude_cutcode']*10+datacc['Pickup_latitude_cutcode']
+
+#change Store_and_fwd_flag to 1 and 0.
+datacc['Store_and_fwd_flag_in'] = (datacc['Store_and_fwd_flag']=='Y')
+
+#Create dummies for location
+datacc = pd.concat([datacc, pd.get_dummies(datacc['Pickup_location_cutcode'], prefix='pickup_location', prefix_sep='_', dummy_na=False, columns=None, sparse=False, drop_first=True)], axis=1)
+
+
+#Dropoff location
+print datacc['Dropoff_longitude'].describe(percentiles=[0.001, 0.01, 0.2, 0.4, 0.5, 0.6, 0.8, 0.99, 0.999])
+print datacc['Dropoff_latitude'].describe(percentiles=[0.001, 0.01, 0.2, 0.4, 0.5, 0.6, 0.8, 0.99, 0.999])
+
+#Devide into 10 by 10 Grid based on percentiles
+longitude_grid = datacc['Dropoff_longitude'].quantile(np.arange(0.1, 1, 0.1)).append(pd.Series([-999, 999])).sort_values().round(decimals=4)
+latitude_grid =datacc['Dropoff_latitude'].quantile(np.arange(0.1, 1, 0.1)).append(pd.Series([-999, 999])).sort_values().round(decimals=4)
+
+datacc['Dropoff_longitude_cut'] = pd.cut(datacc['Dropoff_longitude'], longitude_grid)
+datacc['Dropoff_latitude_cut'] = pd.cut(datacc['Dropoff_latitude'], latitude_grid)
+
+datacc['Dropoff_longitude_cutcode'] = datacc['Dropoff_longitude_cut'].cat.codes
+datacc['Dropoff_latitude_cutcode'] = datacc['Dropoff_latitude_cut'].cat.codes
+datacc['Dropoff_location_cutcode'] = datacc['Dropoff_longitude_cutcode']*10+datacc['Dropoff_latitude_cutcode']
+
+#Create dummies for location
+datacc = pd.concat([datacc, pd.get_dummies(datacc['Dropoff_location_cutcode'], prefix='dropoff_location', prefix_sep='_', dummy_na=False, columns=None, sparse=False, drop_first=True)], axis=1)
+
+"""GBM"""
+#code and methodology reference: https://www.analyticsvidhya.com/blog/2016/02/complete-guide-parameter-tuning-gradient-boosting-gbm-python/
+
+###First run a model with default parameters
+###Use five folder cross-validation
+def modelfit(alg, dtrain, predictors, target, performCV, cv_folds):
+    start = time.time()
+    #Fit the algorithm on the data
+    alg.fit(dtrain[predictors], dtrain[target])
+        
+    #Predict training set:
+    dtrain_predictions = alg.predict(dtrain[predictors])
+    
+    #Perform cross-validation:
+    if performCV:
+        #cv_mae = cross_validation.cross_val_score(alg, dtrain[predictors], dtrain[target], cv=cv_folds, scoring='neg_mean_absolute_error')
+        cv_mse = cross_validation.cross_val_score(alg, dtrain[predictors], dtrain[target], cv=cv_folds, scoring='neg_mean_squared_error', n_jobs = 4)
+    #Print model report:
+    print "\nModel Report"
+    print "Mean Absolute Error (Train): %.4g" % metrics.mean_absolute_error(dtrain[target].values, dtrain_predictions)
+    print "Mean Squared Error (Train): %f" % metrics.mean_squared_error(dtrain[target].values, dtrain_predictions)
+    
+    if performCV:
+        #print "CV Mean Absolute Error: Mean - %.7g | Std - %.7g | Min - %.7g | Max - %.7g" % (np.mean(cv_mae),np.std(cv_mae),np.min(cv_mae),np.max(cv_mae))
+        print "CV Mean Squared Error: Mean - %.7g | Std - %.7g | Min - %.7g | Max - %.7g" % (np.mean(cv_mse),np.std(cv_mse),np.min(cv_mse),np.max(cv_mse))
+    print "Time Elapsed: " + str(time.time()-start)
+    
+    
+predictors = [x for x in datacc.columns if x not in ["lpep_pickup_datetime",	"Lpep_dropoff_datetime",	"Store_and_fwd_flag", "Pickup_longitude",	"Pickup_latitude",	"Dropoff_longitude",	"Dropoff_latitude",	"Tip_amount",	"Ehail_fee",	"Payment_type",	"pick_hour",	"tip_perc",	"Pickup_longitude_cut",	"Pickup_latitude_cut",	"Pickup_longitude_cutcode",	"Pickup_latitude_cutcode",	"Pickup_location_cutcode",	"Dropoff_longitude_cut",	"Dropoff_latitude_cut",	"Dropoff_longitude_cutcode",	"Dropoff_latitude_cutcode",	"Dropoff_location_cutcode"]]
+target = 'tip_perc'
+gbm0 = GradientBoostingRegressor(random_state=111, loss='ls')
+modelfit(gbm0, datacc, predictors, target, True, 3)
+
+"""Tuning"""
+#Tuning # of trees (n_estimators)
+param_test1 = {'n_estimators':range(80,121,20)}
+gsearch1 = GridSearchCV(estimator = GradientBoostingRegressor(learning_rate=0.1, min_samples_split=2,min_samples_leaf=1,max_depth=3,max_features=None,subsample=1,random_state=111), 
+param_grid = param_test1, scoring='neg_mean_squared_error',n_jobs=4,iid=False, cv=3)
+gsearch1.fit(datacc[predictors],datacc[target])
+gsearch1.grid_scores_, gsearch1.best_params_, gsearch1.best_score_
+
+#Turning max_depth
+param_test2 = {'max_depth':range(3,8,2)}
+gsearch2 = GridSearchCV(estimator = GradientBoostingRegressor(learning_rate=0.1, n_estimators=120, min_samples_split=2,min_samples_leaf=1,max_features=None,subsample=1,random_state=111), 
+param_grid = param_test2, scoring='neg_mean_squared_error',n_jobs=4,iid=False, cv=3)
+gsearch2.fit(datacc[predictors],datacc[target])
+gsearch2.grid_scores_, gsearch2.best_params_, gsearch2.best_score_
+
+"""Other tuning for GBM is not performed due to resource/time contraint"""
+
+"""Fit final model with tuned parameters"""
+gbm_tuned =  GradientBoostingRegressor(learning_rate=0.1, n_estimators=120, min_samples_split=2,min_samples_leaf=1,max_depth = 9, max_features=None,subsample=1,random_state=111, loss='ls')
+modelfit(gbm_tuned, datacc, predictors, target, True, 3)
+
+#store the gbm model to .pkl file 
+_ = joblib.dump(gbm_tuned, 'gbm_taxi_tip_pred.pkl', compress=9)
+
+"""Linear Regression"""
+lr0 = LinearRegression()
+modelfit(lr0, datacc, predictors, target, True, 3)
+
+
+"""RandomForest"""
+rf0 = RandomForestRegressor(random_state=111, criterion='mse')
+modelfit(rf0, datacc, predictors, target, True, 3)
+
+""""Reporting for the entire sample: credit card + the rest"""
+#manually checking the model performance.
+datacc['tip_perc_predicted'] = gbm_tuned.predict(datacc[predictors])
+metrics.mean_squared_error(datacc[target].values, datacc['tip_perc_predicted'])
+((datacc[target].values - datacc['tip_perc_predicted'])**2).mean()
+
+#merge the predicted variable to the complete raw dataset
+raw = raw.merge(datacc.loc[:,['tip_perc_predicted']], how='left', on=None, left_on=None, right_on=None, left_index=True, right_index=True, sort=False, suffixes=('_x', '_y'), copy=True, indicator=False)
+#predict tip_perc_predicted to be zero when the payment type is non-cash
+raw.loc[((raw['Payment_type'] != 1) & (raw['tip_perc'].notnull())), 'tip_perc_predicted'] = 0
+
+print "Model performance with all payment types MAE: " + str((abs(raw[target].values - raw['tip_perc_predicted'])).mean())
+print "Model performance with all payment types MSE: " + str(((raw[target].values - raw['tip_perc_predicted'])**2).mean())
+
+
+""""
+Implementation
+The following function predict the tip percentage on the green taxi dataset in NYC.
+The location of the dataset is listed below.
+http://www.nyc.gov/html/tlc/html/about/trip_record_data.shtml
+INPUTS:
+taxi_data_url: a string which is the url of the csv file. An example is listed below for hte September 2015 data that is used as model training sample.
+https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-09.csv
+gbm_file_location: directory of the *.pkl file for the stored gbm model.
+e.g. A:\Dropbox\Hunt\C1\gbm_taxi_tip_pred\gbm_taxi_tip_pred.pkl
+The function returns a dataset with 'tip_perc_predicted' -- the predicted value.
+The function reports Mean Absolute Error (MAE) and Mean Squared Error (MSE) for the predicted values on both the
+subsample with only credit card payment types and the complete sample.
+"""
+def gbm_implement(taxi_data_url, gbm_file_location):
+    pd.options.mode.chained_assignment = None  # default='warn'
+    #import data
+    raw_req=requests.get(taxi_data_url).content
+    raw=pd.read_csv(io.StringIO(raw_req.decode('utf-8')))
+    #trim blank space in column names
+    raw.columns = [col.strip() for col in raw.columns]
+    
+    raw['lpep_pickup_datetime'] = pd.to_datetime(raw['lpep_pickup_datetime'])
+    raw['Lpep_dropoff_datetime'] = pd.to_datetime(raw['Lpep_dropoff_datetime'])
+    
+    #Coordiate of JFK airport terminal Area from Google Map
+    #(40.652421, -73.796020)
+    #(40.652421, -73.773261)
+    #(40.638176, -73.773261)
+    #(40.638176, -73.796020)
+    
+    #define jfk_in = 1 if either pickup or dropoff coordinates fall into the square area noted above.
+    raw['jfk_in'] = ((raw['Pickup_longitude']>-73.796020) & (raw['Pickup_longitude']<-73.773261) & (raw['Pickup_latitude']>40.638176) & (raw['Pickup_latitude']<40.652421)) | ((raw['Dropoff_longitude']>-73.796020) & (raw['Dropoff_longitude']<-73.773261) & (raw['Dropoff_latitude']>40.638176) & (raw['Dropoff_latitude']<40.652421))
+    raw['tip_perc']= raw['Tip_amount']/raw['Total_amount']
+
+    datacc = raw[raw['Payment_type'] == 1 & raw['tip_perc'].notnull()]
+    
+    #create  hour of day and day of week based on pick up time.
+    datacc['pick_hourofday'] = datacc['lpep_pickup_datetime'].dt.hour
+    datacc['pick_dayofweek'] = datacc['lpep_pickup_datetime'].dt.dayofweek
+    
+    #calculate trip time length in the unit minutes.
+    datacc['trip_time'] =(datacc['Lpep_dropoff_datetime'] - datacc['lpep_pickup_datetime']).dt.total_seconds()/60
+    
+    #set missing value for Trip_type to 1.
+    datacc.loc[datacc['Trip_type'].isnull(), 'Trip_type'] = 1
+    
+    #define trip speed;
+    datacc['trip_speed'] = datacc['Trip_distance']/datacc['trip_time']
+    datacc.loc[datacc['trip_speed'].isnull(), 'trip_speed'] = 0
+    datacc.loc[datacc['trip_speed']>999, 'trip_speed'] = 999
+    
+    #assign binning variables for locations
+    pickup_longitude_grid = [-999,	-73.9873,	-73.9722,	-73.9608,	-73.9558,	-73.9517,	-73.9453,	-73.9391,	-73.9226,	-73.8904,	999]
+    pickup_latitude_grid =[-999,	40.679,	40.689,	40.7009,	40.7149,	40.7303,	40.755,	40.7888,	40.8051,	40.8163,	999]
+    
+    datacc['Pickup_longitude_cut'] = pd.cut(datacc['Pickup_longitude'], pickup_longitude_grid)
+    datacc['Pickup_latitude_cut'] = pd.cut(datacc['Pickup_latitude'], pickup_latitude_grid)
+    
+    datacc['Pickup_longitude_cutcode'] = datacc['Pickup_longitude_cut'].cat.codes
+    datacc['Pickup_latitude_cutcode'] = datacc['Pickup_latitude_cut'].cat.codes
+    datacc['Pickup_location_cutcode'] = datacc['Pickup_longitude_cutcode']*10+datacc['Pickup_latitude_cutcode']
+
+    #change Store_and_fwd_flag to 1 and 0.
+    datacc['Store_and_fwd_flag_in'] = (datacc['Store_and_fwd_flag']=='Y')
+    
+    #Create dummies for location
+    datacc = pd.concat([datacc, pd.get_dummies(datacc['Pickup_location_cutcode'], prefix='pickup_location', prefix_sep='_', dummy_na=False, columns=None, sparse=False, drop_first=True)], axis=1)
+    
+    #Devide into 10 by 10 Grid based on percentiles
+    dropoff_longitude_grid = [-999,	-73.9933,	-73.9827,	-73.972,	-73.9612,	-73.954,	-73.9464,	-73.937,	-73.9169,	-73.8722,	999]
+    dropoff_latitude_grid =[-999,	40.6736,	40.688,	40.7046,	40.7206,	40.7399,	40.7565,	40.7708,	40.7903,	40.8121,	999]
+
+    datacc['Dropoff_longitude_cut'] = pd.cut(datacc['Dropoff_longitude'], dropoff_longitude_grid)
+    datacc['Dropoff_latitude_cut'] = pd.cut(datacc['Dropoff_latitude'], dropoff_latitude_grid)
+    
+    datacc['Dropoff_longitude_cutcode'] = datacc['Dropoff_longitude_cut'].cat.codes
+    datacc['Dropoff_latitude_cutcode'] = datacc['Dropoff_latitude_cut'].cat.codes
+    datacc['Dropoff_location_cutcode'] = datacc['Dropoff_longitude_cutcode']*10+datacc['Dropoff_latitude_cutcode']
+
+    #Create dummies for location
+    datacc = pd.concat([datacc, pd.get_dummies(datacc['Dropoff_location_cutcode'], prefix='dropoff_location', prefix_sep='_', dummy_na=False, columns=None, sparse=False, drop_first=True)], axis=1)
+    
+    #import final GBM model
+    predictors = ["VendorID",	"RateCodeID",	"Passenger_count",	"Trip_distance",	"Fare_amount",	"Extra",	"MTA_tax",	"Tolls_amount",	"improvement_surcharge",	"Total_amount",	"Trip_type",	"jfk_in",	"pick_hourofday",	"pick_dayofweek",	"trip_time",	"trip_speed",	"Store_and_fwd_flag_in",	"pickup_location_1",	"pickup_location_2",	"pickup_location_3",	"pickup_location_4",	"pickup_location_5",	"pickup_location_6",	"pickup_location_8",	"pickup_location_9",	"pickup_location_10",	"pickup_location_11",	"pickup_location_12",	"pickup_location_13",	"pickup_location_14",	"pickup_location_16",	"pickup_location_19",	"pickup_location_20",	"pickup_location_21",	"pickup_location_22",	"pickup_location_23",	"pickup_location_24",	"pickup_location_25",	"pickup_location_26",	"pickup_location_27",	"pickup_location_28",	"pickup_location_29",	"pickup_location_30",	"pickup_location_31",	"pickup_location_32",	"pickup_location_33",	"pickup_location_34",	"pickup_location_35",	"pickup_location_36",	"pickup_location_37",	"pickup_location_38",	"pickup_location_39",	"pickup_location_40",	"pickup_location_41",	"pickup_location_42",	"pickup_location_43",	"pickup_location_44",	"pickup_location_45",	"pickup_location_46",	"pickup_location_47",	"pickup_location_48",	"pickup_location_49",	"pickup_location_50",	"pickup_location_51",	"pickup_location_52",	"pickup_location_53",	"pickup_location_54",	"pickup_location_55",	"pickup_location_56",	"pickup_location_57",	"pickup_location_58",	"pickup_location_59",	"pickup_location_60",	"pickup_location_61",	"pickup_location_62",	"pickup_location_63",	"pickup_location_64",	"pickup_location_65",	"pickup_location_66",	"pickup_location_67",	"pickup_location_68",	"pickup_location_69",	"pickup_location_70",	"pickup_location_71",	"pickup_location_72",	"pickup_location_73",	"pickup_location_74",	"pickup_location_75",	"pickup_location_76",	"pickup_location_77",	"pickup_location_78",	"pickup_location_79",	"pickup_location_80",	"pickup_location_81",	"pickup_location_82",	"pickup_location_83",	"pickup_location_84",	"pickup_location_85",	"pickup_location_86",	"pickup_location_87",	"pickup_location_88",	"pickup_location_89",	"pickup_location_90",	"pickup_location_91",	"pickup_location_92",	"pickup_location_93",	"pickup_location_94",	"pickup_location_95",	"pickup_location_96",	"pickup_location_97",	"pickup_location_98",	"pickup_location_99",	"dropoff_location_1",	"dropoff_location_2",	"dropoff_location_3",	"dropoff_location_4",	"dropoff_location_5",	"dropoff_location_6",	"dropoff_location_7",	"dropoff_location_8",	"dropoff_location_9",	"dropoff_location_10",	"dropoff_location_11",	"dropoff_location_12",	"dropoff_location_13",	"dropoff_location_14",	"dropoff_location_15",	"dropoff_location_16",	"dropoff_location_17",	"dropoff_location_18",	"dropoff_location_19",	"dropoff_location_20",	"dropoff_location_21",	"dropoff_location_22",	"dropoff_location_23",	"dropoff_location_24",	"dropoff_location_25",	"dropoff_location_26",	"dropoff_location_27",	"dropoff_location_28",	"dropoff_location_29",	"dropoff_location_30",	"dropoff_location_31",	"dropoff_location_32",	"dropoff_location_33",	"dropoff_location_34",	"dropoff_location_35",	"dropoff_location_36",	"dropoff_location_37",	"dropoff_location_38",	"dropoff_location_39",	"dropoff_location_40",	"dropoff_location_41",	"dropoff_location_42",	"dropoff_location_43",	"dropoff_location_44",	"dropoff_location_45",	"dropoff_location_46",	"dropoff_location_47",	"dropoff_location_48",	"dropoff_location_49",	"dropoff_location_50",	"dropoff_location_51",	"dropoff_location_52",	"dropoff_location_53",	"dropoff_location_54",	"dropoff_location_55",	"dropoff_location_56",	"dropoff_location_57",	"dropoff_location_58",	"dropoff_location_59",	"dropoff_location_60",	"dropoff_location_61",	"dropoff_location_62",	"dropoff_location_63",	"dropoff_location_64",	"dropoff_location_65",	"dropoff_location_66",	"dropoff_location_67",	"dropoff_location_68",	"dropoff_location_69",	"dropoff_location_70",	"dropoff_location_71",	"dropoff_location_72",	"dropoff_location_73",	"dropoff_location_74",	"dropoff_location_75",	"dropoff_location_76",	"dropoff_location_77",	"dropoff_location_78",	"dropoff_location_79",	"dropoff_location_80",	"dropoff_location_81",	"dropoff_location_82",	"dropoff_location_83",	"dropoff_location_84",	"dropoff_location_85",	"dropoff_location_86",	"dropoff_location_87",	"dropoff_location_88",	"dropoff_location_89",	"dropoff_location_90",	"dropoff_location_91",	"dropoff_location_92",	"dropoff_location_93",	"dropoff_location_94",	"dropoff_location_95",	"dropoff_location_96",	"dropoff_location_97",	"dropoff_location_98",	"dropoff_location_99"]
+    #if a location indicator is not created due to non-existance, create a variable with zero as its value.
+    for p in predictors:
+        if p not in datacc.columns:
+            datacc[p] = 0
+    
+    gbm_stored = joblib.load(gbm_file_location)
+    datacc['tip_perc_predicted'] = gbm_stored.predict(datacc[predictors])
+    print "Model performance for only credit card MAE: " + str((abs(datacc[target].values - datacc['tip_perc_predicted'])).mean())
+    print "Model performance for only credit card MSE: " + str(((datacc[target].values - datacc['tip_perc_predicted'])**2).mean())
+    
+    #merge the predicted variable to the complete raw dataset
+    raw = raw.merge(datacc.loc[:,['tip_perc_predicted']], how='left', on=None, left_on=None, right_on=None, left_index=True, right_index=True, sort=False, suffixes=('_x', '_y'), copy=True, indicator=False)
+    #predict tip_perc_predicted to be zero when the payment type is non-cash
+    raw.loc[((raw['Payment_type'] != 1) & (raw['tip_perc'].notnull())), 'tip_perc_predicted'] = 0
+    
+    print "Model performance with all payment types MAE: " + str((abs(raw[target].values - raw['tip_perc_predicted'])).mean())
+    print "Model performance with all payment types MSE: " + str(((raw[target].values - raw['tip_perc_predicted'])**2).mean())
+    
+    return raw
+
+#test on Sep 2015 data -- get same performance as the original steps
+temp = gbm_implement("https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-09.csv", "A:\Dropbox\Hunt\C1\gbm_taxi_tip_pred.pkl")
+#test on Oct 2015 data -- get same performance as the original steps
+temp = gbm_implement("https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-10.csv", "A:\Dropbox\Hunt\C1\gbm_taxi_tip_pred.pkl")
+#test on Oct 2015 data -- get same performance as the original steps
+temp = gbm_implement("https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-11.csv", "A:\Dropbox\Hunt\C1\gbm_taxi_tip_pred.pkl")
+
+
+"""Q5"""
+#define trip speed in unit of mph;
+raw['trip_speed_mph'] = raw['Trip_distance']/((raw['Lpep_dropoff_datetime'] - raw['lpep_pickup_datetime']).dt.total_seconds()/3600)
+raw.loc[raw['trip_speed_mph']>100, 'trip_speed_mph'] = 100
+
+raw['pickup_weekofyear'] = raw['lpep_pickup_datetime'].dt.week
+print "Average of Trip Speed by week"
+print raw.groupby('pickup_weekofyear').agg({'trip_speed_mph':['count', 'mean', 'std']})
+print ""
+
+raw['pickup_date'] = raw['lpep_pickup_datetime'].dt.date
+print raw.groupby('pickup_date').agg({'trip_speed_mph':['count', 'mean', 'std']})
+
+raw['pickup_hourofday'] = raw['lpep_pickup_datetime'].dt.hour
+print "Average of Hour of Day"
+print raw.groupby('pickup_hourofday').agg({'trip_speed_mph':['count', 'mean', 'std']})
